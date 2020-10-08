@@ -1,6 +1,8 @@
 package playwright
 
 import (
+	"bytes"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -9,6 +11,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"time"
+
+	"github.com/getsentry/sentry-go"
+	"github.com/gwatts/rootcerts"
 )
 
 func getDriverURL() (string, string) {
@@ -29,6 +35,16 @@ func getDriverURL() (string, string) {
 func installPlaywright() (string, error) {
 	driverURL, driverName := getDriverURL()
 	cwd, err := os.Getwd()
+	httpClient := http.Client{
+		Timeout: time.Second * 30,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ClientHello: tls.HelloChrome_83,
+				RootCAs:     rootcerts.ServerCertPool(),
+			},
+			ForceAttemptHTTP2: true,
+		},
+	}
 	if err != nil {
 		return "", fmt.Errorf("could not get cwd: %w", err)
 	}
@@ -43,7 +59,7 @@ func installPlaywright() (string, error) {
 		return driverPath, nil
 	}
 	log.Println("Downloading driver...")
-	resp, err := http.Get(driverURL)
+	resp, err := RequestContent(&httpClient, "GET", driverURL, "", RequestOptions{})
 	if err != nil {
 		return "", fmt.Errorf("could not download driver: %w", err)
 	}
@@ -104,6 +120,7 @@ func Install() error {
 	return nil
 }
 
+// Run runs
 func Run() (*Playwright, error) {
 	driverPath, err := installPlaywright()
 	if err != nil {
@@ -134,4 +151,44 @@ func Run() (*Playwright, error) {
 		return nil, fmt.Errorf("could not call object: %w", err)
 	}
 	return obj.(*Playwright), nil
+}
+
+// RequestOptions defines the options given by each request wrapper function
+type RequestOptions struct {
+	Headers        map[string]string
+	Body           []byte
+	IgnoreRedirect bool
+}
+
+// RequestContent finally handles all requests after passed through wrappers
+// Assigns all headers to Request and userAgent defined from base wrapper if not in Request options
+func RequestContent(client *http.Client, method string, url string, userAgent string, options RequestOptions) (*http.Response, error) {
+	defer sentry.Recover()
+
+	req, _ := http.NewRequest(method, url, bytes.NewBuffer(options.Body))
+
+	for k, v := range options.Headers {
+		req.Header.Add(k, v)
+	}
+
+	if options.Headers["user-agent"] == "" {
+		req.Header.Add("user-agent", userAgent)
+	}
+
+	if !options.IgnoreRedirect {
+		return client.Do(req)
+	}
+
+	// Ignore redirect must use special check redirect function
+	originalRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	res, err := client.Do(req)
+
+	client.CheckRedirect = originalRedirect
+
+	return res, err
+
 }
